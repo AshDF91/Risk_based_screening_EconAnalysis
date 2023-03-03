@@ -1,0 +1,499 @@
+## The below code was adapted from previous work to be applied to this (risk-stratified screening for) breast cancer setting ##
+
+
+# Krijkamp EM, Alarid-Escudero F, Enns EA, Jalal HJ, Hunink MGM, Pechlivanoglou P. 
+# Microsimulation modeling for health decision sciences using R: A tutorial. 
+# Med Decis Making. 2018;38(3):400–22.
+#
+#
+#
+# https://github.com/DARTH-git/Microsimulation-tutorial
+
+
+
+################################################################################
+#                            Inputs for model                                  #
+################################################################################
+
+## Runs base case scenario with partially decent numbers ##
+## Then runs probabilistic sensitivity analysis for selected parameters ##
+
+################################################################################
+################################################################################
+
+
+#-------------------------#
+# Overall model structure #
+#-------------------------#
+
+# Number of individuals being fed into simulation  #
+n.i   <- 100000    # Testing ranges between 10,000 to 250,000 to get an idea of computational time (i.e. for later PSA)    
+
+# Number of cycles the model will run for (60 years from age 40 = age 100 or death [if occurring prior]) #
+n.t   <- 60                            
+
+# Vector of states that individuals can occupy/transition into #
+v.n   <- c("No cancer", "DCIS", "Local breast cancer", "Regional breast cancer",
+           "Metastatic breast cancer", "Breast cancer death", "Other cause death")
+
+# Number of health states #
+n.s   <- length(v.n)           
+
+# State in which everyone starts - no breast cancer #
+v.M_1 <- rep("No cancer", n.i)         
+
+# Discounting rates (d) for costs (d.c) and utilities/effects (d.e) - both 3.5% as per NICE #
+d.c   <- d.e <- 0.035                  
+
+
+#-------#
+# Costs #
+#-------#
+# These are a combination of placeholders to get mechanics of code working, and prices from lit (nor yet updated to 2022) #
+# These are all prefixed with 'c' to denote cost parameter # 
+
+# Cost of being in 'No breast cancer' state #
+c.healthy <- 0
+
+# Cost of DCIS/breast diagnosis and initial treatment (first year), by stage group #  
+c.dcis               <- 4000
+c.early_cancer       <- 5167          
+c.regional_cancer    <- 13300 
+c.metastatic_cancer  <- 19633
+
+# Costs of annual follow-up and adjuvant therapy #
+c.follow_up          <- 1436
+
+# Costs of care for terminal breast cancer (to be accrued when cycles into 'breast cancer death' state) #
+c.breast_ca_death    <- 16452
+
+# Cost of mammography #
+c.mammography        <- 58.48    # Below run is non-screened population, but here for later use in screening strategies
+
+# Cost of risk assessment #
+c.risk_assess        <- 0.5
+
+# Costs of completing triple assessment after mammogram (breast biopsy and USS)
+# Average cost per individual - easier to model and bakes in the overall costs #
+c.biopsy_uss         <- 1117*0.03828976     # 85,559 of all screened (2,234,514) get follow-up investigation (NHS BSP stats 2020)
+
+
+#-------------------------------------------#
+# Utility values of different health states #
+#-------------------------------------------#
+
+# These are all prefixed with 'u' to denote utility #
+
+# Average woman aged 40 (no breast cancer) #  
+u.healthy              <- 0.8824
+
+# Average annual decrement in health state (QALYs) #
+u.annual_reduction     <- -0.0043                  # This will be factored in later 
+
+# Utility in first yar of DCIS diagnosis #
+u.dcis_diagnosis       <- 0.774              
+
+# Utility of DCIS n subsequent years #
+u.dcis_after           <- 0.779
+
+# Utility of early breast cancer diagnosis in 1st year #
+u.local_diagnosis        <- 0.696
+
+# Utility of early breast cancer in subsequent years (same as for DCIS, but here for clarity)
+u.local_after            <- 0.779 
+
+# Utility of diagnosis and follow-up for regional breast cancer (Stage III) #
+u.regional_cancer       <- 0.685
+
+# Utility of diagnosis and follow-up for metastatic cancer #
+u.metastatic_cancer     <- 0.55
+
+# Utility in death states - by definition, zero # 
+u.death                 <- 0
+
+
+#--------------------------------------------------------#
+# Transition probabilities for entering different states #
+#--------------------------------------------------------#
+
+# Transition into different stages of breast cancer, based on screening intensity #
+# These are based on the probability of moving from no breast cancer to breast cancer,  
+# and weighted by the proportion of cases detected in different stages. 
+# E.g. probability of being diagnosed with cancer is X, Y% of those will be in stage Z #
+
+# Probability that if a cancer is diagnosed, it is a localised cancer #
+p.local_cancer      <- 0.484
+
+# Probability that if a cancer is diagnosed, it is a regional cancer #
+p.regional_cancer   <- 0.443  
+
+# Probability that if a cancer is diagnosed, it is a metastatic cancer #
+p.metastatic_cancer <- 0.073
+
+
+# Transition probabilities (per cycle) # 
+
+# Probability to move from no breast cancer to breast cancer #  
+p.healthy_cancer             <- 0.01       
+
+# Probability to move from no breast cancer to DCIS #
+p.healthy_dcis               <- 0.01 
+
+# Probability to move from no breast cancer to other (non-breast cancer) death #
+p.healthy_other_death        <- 0.001                
+
+# Probability to move from local breast cancer to breast cancer death #
+p.local_breast_death         <- 0.5  
+# Probability to move from local breast cancer to other cause death #
+p.local_other_death          <- 0.009
+
+# Probability to move from regional breast cancer to breast cancer death #
+p.regional_breast_death      <- 0.010
+# Probability to move from regional breast cancer to other cause death #
+p.regional_other_death       <- 0.011
+
+# Probability to move from metastatic cancer to breast cancer death #
+p.metastatic_breast_death    <- 0.3 
+# Probability to move from metastatic cancer to other cause death #
+p.metastatic_other_death     <- 0.1
+
+# Updating risk of incident breast cancer with each year increase in age #
+# In real thing, might use Weibull model?? Or use average annual increment in risk 
+#rp.bc <- 0.1   # Just to try code out 
+
+
+# Multiplier effect of DCIS - those in DCIS state have higher risk of subsequent
+# risk of breast cancer diagnosis and breast cancer death # 
+rr.dcis        <- 2.52  
+
+# Need to consider rates and probabilities #
+# Rate of breast cancer diagnosis when healthy #
+r.healthy_cancer <- -log(1-p.healthy_cancer)
+# rate of breast cancer diagnosis when DCIS #
+r.dcis_cancer    <- rr.dcis * r.healthy_cancer 
+# Probability to get breast cancer diagnosis when have history of DCIS #
+p.dcis_cancer <- 1 - exp(-r.dcis_cancer) 
+
+
+
+################################################################################
+################################################################################
+
+
+## Using samplev from DARTH ##
+## This helps vectorise the below code and has major computational benefits #
+samplev <- function (probs, m) {
+  d <- dim(probs)
+  n <- d[1]
+  k <- d[2]
+  lev <- dimnames(probs)[[2]]
+  if (!length(lev)) 
+    lev <- 1:k
+  ran <- matrix(lev[1], ncol = m, nrow = n)
+  U <- t(probs)
+  for(i in 2:k) {
+    U[i, ] <- U[i, ] + U[i - 1, ]
+  }
+  if (any((U[k, ] - 1) > 1e-05))
+    stop("error in multinom: probabilities do not sum to 1")
+  
+  for (j in 1:m) {
+    un <- rep(runif(n), rep(k, n))
+    ran[, j] <- lev[1 + colSums(un > U)]
+  }
+  ran
+}
+
+
+
+# The MicroSim2 functions for the Markov microsimulation #
+
+MicroSim <- function(v.M_1, n.i, n.t, v.n, d.c, d.e, TR.out = TRUE, TS.out = TRUE, seed = 100) {   
+  # Arguments:  
+  # v.M_1:   vector of initial states for individuals 
+  # n.i:     number of individuals
+  # n.t:     total number of cycles to run the model
+  # v.n:     vector of health state names
+  # d.c:     discount rate for costs
+  # d.e:     discount rate for health outcomes (QALYs)
+  # TR.out:  should the output include a microsimulation trace? (default is TRUE)
+  # TS.out:  should the output include a matrix of transitions between states? (default is TRUE)
+  # seed:    starting seed number for random number generator (default is 1)
+  
+  # Makes use of (defined below):
+  # Probs:   function for the estimation of transition probabilities
+  # Costs:   function for the estimation of cost state values
+  # Effs:    function for the estimation of state specific health outcomes (QALYs)
+  
+  v.dwc <- 1 / ((1 + d.c) ^ (0:n.t))   # calculate the cost discount weight based on the discount rate d.c
+  v.dwe <- 1 / ((1 + d.e) ^ (0:n.t))   # calculate the QALY discount weight based on the discount rate d.e
+  
+  # create the matrix capturing the state name/costs/health outcomes for all individuals at each time point 
+  m.M <- m.C <- m.E <- matrix(nrow = n.i, ncol = n.t + 1,
+                              dimnames = list(paste("ind",   1:n.i, sep =" "),
+                                              paste("cycle", 0:n.t, sep =" "))) 
+  
+  # Initial health state - all are "No breast cancer" #
+  m.M[, 1] <- v.M_1            
+  
+  set.seed(seed) 
+  
+  # Create the 'dur' variable which is used to track number of consecutive cycles 
+  # person occupies states where there are time-varying costs #
+  dur       <- rep(0, n.i)
+  deathtime <- rep(0, n.i)
+  time      <- rep(0, n.i) 
+  
+  m.C[, 1] <- Costs(m.M[, 1], dur, deathtime)  # Costs in the initial health state 
+  m.E[, 1] <- Effs(m.M[, 1])                   # Utility values (QALY) for those in initial health state 
+  
+  
+  for (t in 1:n.t) {      # Loop over number of cycles, from start to finish 
+    
+    m.p <- Probs(m.M[, t], time)    # Matrix of probabilities, states at time 't'
+    
+    m.M[, t + 1] <- samplev(prob = m.p, m = 1)              # sample the next health state and store that state in matrix m.M 
+    m.C[, t + 1] <- Costs(m.M[, t + 1], dur, deathtime)     # estimate costs per individual during cycle t + 1 
+    m.E[, t + 1] <- Effs( m.M[, t + 1])                     # estimate QALYs per individual during cycle t + 1 
+    
+    # dur variable - back to this now, when people enter states where costs change with how long they are in that state, 
+    # we need to know this and apportion costs accordingly. 
+    # Use ifelse function - if they occupy DCIS/others in the next time (t+1), increment it up 
+    # dur==0 first time in state, dur=1 next year, so on. 
+    
+    dur <- ifelse(m.M[, t + 1] == "DCIS" | m.M[, t + 1] == "Local breast cancer" | m.M[, t + 1] == "Regional breast cancer" | m.M[, t + 1] == "Metastatic breast cancer", 
+                  dur + 1, 
+                  0) 
+    
+    # Breast cancer death is an aborbing state - in this model, we apportion costs of terminal cancer care on entry into this state, 
+    # then people cost 0 thereafter. 
+    # During initial coding runs, the code did not 'like' having breast cancer death handled with 'dur' - noted when 
+    # transitioned from one type of cancer to breast cancer death. Therefore, handle time spent in death state with imaginatively named 
+    # deathtime. Deathtime=0 means just entered this state. 
+    deathtime <- ifelse(m.M[, t + 1] == "Breast cancer death" , 
+                        deathtime + 1, 
+                        0)
+    
+    # Lastly, generate 'time variable' - this is to modify breast cancer incidence rate as people age #
+    time <- ifelse(m.M[, t+1] == "No cancer", 
+                   time + 1, 
+                   0)
+    
+    cat('\r', paste(round(t/n.t * 100), "% done", sep = " "))       # display the progress of the simulation
+    
+  }
+  
+  
+  tc <- m.C %*% v.dwc       # total (discounted) cost per individual
+  te <- m.E %*% v.dwe       # total (discounted) QALYs per individual 
+  
+  tc_hat <- mean(tc)        # average (discounted) cost 
+  te_hat <- mean(te)        # average (discounted) QALYs
+  
+  if (TS.out == TRUE) {  # create a matrix of transitions across states if wanted 
+    TS <- paste(m.M, cbind(m.M[, -1], NA), sep = "->") # transitions from one state to the other
+    TS <- matrix(TS, nrow = n.i)
+    rownames(TS) <- paste("Ind",   1:n.i, sep = " ")   # name the rows (Individual)
+    colnames(TS) <- paste("Cycle", 0:n.t, sep = " ")   # name the columns (ycle number) 
+  } else {
+    TS <- NULL
+  }
+  
+  if (TR.out == TRUE) {
+    TR <- t(apply(m.M, 2, function(x) table(factor(x, levels = v.n, ordered = TRUE))))
+    TR <- TR / n.i                                       # create a distribution trace
+    rownames(TR) <- paste("Cycle", 0:n.t, sep = " ")     # name the rows 
+    colnames(TR) <- v.n                                  # name the columns 
+  } else {
+    TR <- NULL
+  }
+  results <- list(m.M = m.M, m.C = m.C, m.E = m.E, tc = tc, te = te, tc_hat = tc_hat, te_hat = te_hat, TS = TS, TR = TR) # store the results from the simulation in a list  
+  return(results)  # return the results! 
+}  
+
+# end of the MicroSim function  
+
+
+#### Probability function
+# The Probs function that updates the transition probabilities of every cycle is shown below.
+
+Probs <- function(M_it, time) {   
+  # M_it:        health state occupied by individual i at cycle t (character variable)
+  # time:        variable that increments up each cycle, represents age (years after 40) 
+  
+  m.p.it <- matrix(NA, n.s, n.i)     # create vector of state transition probabilities
+  rownames(m.p.it) <- v.n            # name the vector
+  
+  # In this version, rate of transitioning from no breast cancer to breast cancer state varies by age ('time')
+  # Need to update the transition probabilities based on how (increasingly) old people get 
+  # Handle age-varying incidence rate with regression model (log incidence on age) fitted in Stata using incidence table
+  
+  p.healthy_cancer <- exp(-7.485587 + (1+time[M_it == "No cancer"])*0.0183122)   # this works! Next, apply to DCIS. 
+  
+  # update m.p.it with the appropriate probabilities   
+  m.p.it[,M_it ==  "No cancer"]                 <- rbind(1 - p.healthy_dcis - p.healthy_cancer*p.local_cancer - p.healthy_cancer*p.regional_cancer - p.healthy_cancer*p.metastatic_cancer - p.healthy_other_death, p.healthy_dcis, p.healthy_cancer*p.local_cancer, p.healthy_cancer*p.regional_cancer, p.healthy_cancer*p.metastatic_cancer, 0, p.healthy_other_death)
+  m.p.it[,M_it ==  "DCIS"]                      <- c(0, 1 - p.dcis_cancer*p.local_cancer - p.dcis_cancer*p.regional_cancer - p.dcis_cancer*p.metastatic_cancer - p.healthy_other_death, p.dcis_cancer*p.local_cancer, p.dcis_cancer*p.regional_cancer, p.dcis_cancer*p.metastatic_cancer, 0, p.healthy_other_death)
+  m.p.it[,M_it ==  "Local breast cancer"]       <- c(0, 0, 1 - p.local_breast_death - p.local_other_death,  0, 0,  p.local_breast_death, p.local_other_death)
+  m.p.it[,M_it ==  "Regional breast cancer"]    <- c(0, 0, 0, 1 - p.regional_breast_death - p.regional_other_death, 0,  p.regional_breast_death, p.regional_other_death)
+  m.p.it[,M_it ==  "Metastatic breast cancer"]  <- c(0, 0, 0, 0, 1 - p.metastatic_breast_death - p.metastatic_other_death,  p.metastatic_breast_death,  p.metastatic_other_death)
+  m.p.it[,M_it ==  "Breast cancer death"]       <- c(0, 0, 0, 0, 0, 1, 0)
+  m.p.it[,M_it ==  "Other cause death"]         <- c(0, 0, 0, 0, 0, 0, 1)
+  
+  ifelse(colSums(m.p.it) == 1, return(t(m.p.it)), print("Probabilities do not sum to 1")) # return the transition probabilities or produce an error
+}    
+
+### Costs function
+# The Costs function estimates the costs at every cycle for the extended microsimulaton.
+
+Costs <- function (M_it, dur, deathtime) {  
+  
+  # Update costs based on duration of time spent in state, e.g. diagnosis costs versus follow-up years costs   
+  
+  c.it                                     <- 0    # Default costs are 0
+  c.it[M_it == "No cancer"]                <- 0    # Not having breast cancer does not accrue costs for this breast cancer-focussed model 
+  
+  # Assign costs for DCIS state depending on how long they've been in there #
+  # First-year costs are the diagnostic and initial treatment #
+  # Subsequent costs are 0. Dur==0 means just entered that state, then dur = 1 in state at t+1 
+  c.it[M_it == "DCIS"]                     <- 0
+  c.it[M_it == "DCIS" & dur==0]            <- c.dcis
+  
+  # Assign costs for diagnosis and initial treatment of local breast cancer #
+  c.it[M_it == "Local breast cancer" & dur==0]           <- c.early_cancer
+  # Assign costs for follow-up and adjuvant therapy, up to max of 5 years #
+  c.it[M_it == "Local breast cancer" & dur>0 & dur<=5]   <- c.follow_up
+  c.it[M_it == "Local breast cancer" & dur>5]            <- 0
+  
+  # Assign costs for regional breast cancer 
+  c.it[M_it == "Regional breast cancer" & dur==0 ]          <- c.regional_cancer
+  # Assign costs for follow-up and adjuvant therapy of regional breast cancer # 
+  c.it[M_it == "Regional breast cancer" & dur>0 & dur<=5]   <- c.follow_up
+  c.it[M_it == "Regional breast cancer" & dur>5]            <- 0
+  
+  # Assign costs for initial diagnosis and treatment of metastatic breast cancer #
+  c.it[M_it == "Metastatic breast cancer" & dur==0]         <- c.metastatic_cancer
+  # Assign costs for follow-up for metastatic breast cancer # 
+  c.it[M_it == "Metastatic breast cancer" & dur>0 & dur<=5] <- c.follow_up
+  c.it[M_it == "Metastatic breast cancer" & dur>5]          <- 0
+  
+  # Assign costs for end-of-life care when dying from breast cancer #
+  c.it[M_it == "Breast cancer death" & deathtime==0]    <- c.breast_ca_death
+  c.it[M_it == "Breast cancer death" & deathtime>0]     <- 0
+  
+  # Cost of dying from something else (were are not doing wider perspective, so 0) #
+  c.it[M_it == "Other cause death"]        <- 0
+  
+  return(c.it)                                # return the costs
+  
+}
+
+
+### Health outcome function 
+# The Effs function to update the utilities at every cycle for the extended microsimulaton.
+
+Effs <- function (M_it, cl = 1) {     # Time is number of Markov cycles - i.e years since simulation started 
+  # M_it: health state occupied by individual i at cycle t (character variable)
+  # cl:   the cycle length (default = 1 )
+  
+  u.it               <- 0        # by default the utility for everyone is zero
+  u.it[M_it == "No cancer"]                <- u.healthy
+  u.it[M_it == "DCIS"]                     <- u.dcis_diagnosis
+  u.it[M_it == "Local breast cancer"]      <- u.local_diagnosis
+  u.it[M_it == "Regional breast cancer"]   <- u.regional_cancer
+  u.it[M_it == "Metastatic breast cancer"] <- u.metastatic_cancer
+  u.it[M_it == "Breast cancer death"]      <- 0 
+  u.it[M_it == "Other cause death"]        <- 0 
+  
+  QALYs <- u.it * cl             # calculate the QALYs during cycle t
+  return(QALYs)                  # return the results
+}
+
+
+
+
+## Start the simulation ##
+
+start <- Sys.time() 
+simulation2 <- MicroSim(v.M_1, n.i, n.t, v.n, d.c, d.e)
+end <- Sys.time() 
+
+end-start        
+
+
+################################################################################
+################################################################################
+
+
+## Probabilistic sensitivity analyses ##
+
+
+# Clear memory a bit #
+rm(simulation2)    
+
+
+################################################################################
+################################################################################
+
+start <- Sys.time() 
+
+# Number of times to repeat the simulation #
+n.sims <- 1000
+
+# Make a data frame for storing results from each iteration #
+psa_results <- data.frame(matrix(NA, nrow=n.sims, ncol = 3))
+# Label columns of the results storing frame #
+colnames(psa_results) <- c("Number breast cancer deaths", "Total costs", "Total QALYs")
+
+
+# Declare a number for setting seed inside the loop - each iteration is seed + iteration loop #
+seed <- 1991
+
+
+# Set up and run loop #
+
+for (a in 1:n.sims) {
+  
+  # Progress information  #
+  # Print note when the MicroSim has run 5 times #
+  if (a%%5==0){
+    cat("\n loop iteration = ", a) 
+  }
+  
+  # Sampling values for costs - just for example purposes  #
+  c.dcis               <- rnorm(1, mean = 4000,  sd=20)
+
+  # Sampling value for a QALY - just for example purposes #
+  u.local_diagnosis   <- rnorm(1, mean = 0.696, sd=0.1) 
+  
+  # Set the seed for this loop iteration, then feed to MicroSim function #
+  loop_seed <- seed + a
+  
+  # Run the MicroSim function with these settings 
+  simulation <- MicroSim(v.M_1, n.i, n.t, v.n, d.c, d.e, seed = loop_seed)
+  
+  # Store number of breast cancer deaths #
+  psa_results[a, 1] <- simulation$TR[61, 6]*n.i 
+  
+  # Store average costs # 
+  psa_results[a, 2] <- simulation$tc_hat 
+  
+  # Store average QALYs
+  psa_results[a, 3] <- simulation$te_hat 
+  
+  rm(simulation)
+  
+}
+
+end <- Sys.time() 
+
+end-start 
+
+
+# Quick look #
+head(psa_results) 
+summary(psa_results) 
+
+
+################################################################################
+################################################################################
+
