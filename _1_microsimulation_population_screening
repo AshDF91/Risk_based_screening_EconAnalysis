@@ -1,0 +1,542 @@
+################################################################################
+#                            Inputs for model                                  #
+################################################################################
+
+# Runs base case scenario incorporating parameters from 'Parameterisation' Doc #
+# Then runs probabilistic sensitivity analysis for selected parameters #
+
+################################################################################
+################################################################################
+
+
+
+#-------------------------#
+# Overall model structure #
+#-------------------------#
+
+# Number of individuals being fed into simulation  #
+# Based on ONS estimate of the female population aged 40 in moist recently available stats (2019) - 
+# https://www.ons.gov.uk/peoplepopulationandcommunity/populationandmigration/populationestimates/datasets/populationestimatesforukenglandandwalesscotlandandnorthernireland # 
+n.i   <- 457724   
+
+# Number of cycles the model will run for (60 years from age 40) #
+n.t   <- 60                            
+
+# Vector of states that individuals can occupy/transition into #
+v.n   <- c("No cancer", "DCIS", "Stage 1 cancer", "Stage 2 cancer",
+           "Stage 3 cancer", "Stage 4 cancer", "Breast cancer death", 
+           "Other cause death")
+
+# Number of health states #
+n.s   <- length(v.n)           
+
+# State in which everyone starts - no breast cancer #
+v.M_1 <- rep("No cancer", n.i)         
+
+# Discounting rates (d) for costs (d.c) and utilities/effects (d.e) - both 3.5% for now #
+d.c <- d.e <- 0.035                  
+
+
+#-------#
+# Costs #
+#-------#
+
+# These are all prefixed with 'c' to denote cost parameter # 
+
+# Cost of being in 'No breast cancer' state #
+c.healthy <- 0
+
+# Cost of DCIS/breast diagnosis and initial treatment (first year), by stage #  
+c.dcis              <- 5000
+c.stage1_cancer     <- 6247          
+c.stage2_cancer     <- 9204 
+c.stage3_cancer     <- 16080 
+c.stage4_cancer     <- 19890
+
+# Average costs of annual follow-up and adjuvant therapy #
+c.follow_up          <- 1736
+
+# Costs of care for terminal breast cancer (to be accrued when cycles into 'breast cancer death' state) #
+c.breast_ca_death    <- 19890
+
+# Cost of mammography and possible follow-on triple assessment #
+# This is habdled as an average, spread across all women, so that there is no need
+# for an additional state for 'post-mammogram activity'. Applying the average cost
+# to all women bakes in the total costs of the screening programme leading to FPs#
+c.mammography        <- 58.48 + 45.07
+
+
+#-------------------------------------------#
+# Utility values of different health states #
+#-------------------------------------------#
+
+# These are all prefixed with 'u' to denote utility #
+
+# Average woman aged 40 (no breast cancer) #  
+u.healthy              <- 0.8824
+
+# Average annual decrement in health state (QALYs) #
+u.annual_reduction     <- -0.0043                
+
+# Utility in first yar of DCIS diagnosis #
+u.dcis_diagnosis       <- 0.774              
+
+# Utility of DCIS n subsequent years #
+u.dcis_after           <- 0.779
+
+# Utility of early breast cancer diagnosis in 1st year #
+u.local_diagnosis        <- 0.696
+
+# Utility of early breast cancer in subsequent years (same as for DCIS, but here for clarity)
+u.local_after            <- 0.779 
+
+# Utility of diagnosis and follow-up for regional breast cancer (Stage III) #
+u.regional_cancer       <- 0.685
+
+# Utility of diagnosis and follow-up for metastatic cancer #
+u.metastatic_cancer     <- 0.55
+
+# Utility in death states - by definition, zero # 
+u.death                 <- 0
+
+
+#--------------------------------------------------------#
+# Transition probabilities for entering different states #
+#--------------------------------------------------------#
+
+# Transition into different stages of breast cancer, based on screening intensity #
+# These are based on the probability of moving from no breast cancer to breast cancer,  
+# and weighted by the proportion of cases detected in different stages. 
+# E.g. probability of being diagnosed with cancer is X, Y% of those will be in stage Z #
+
+# These are the values for all women aged 20+ years from QResearch #
+# Use these for the base case model #
+p.stage1  <- 0.4545
+p.stage2  <- 0.4040
+p.stage3  <- 0.0864
+p.stage4  <- 0.0551
+
+# Multiplier effect of DCIS - those in DCIS state have higher risk of subsequent
+# risk of breast cancer diagnosis and breast cancer death # 
+rr.dcis        <- 2.52
+
+
+################################################################################
+################################################################################
+
+
+## Using samplev from DARTH ##
+
+samplev <- function (probs, m) {
+  d <- dim(probs)
+  n <- d[1]
+  k <- d[2]
+  lev <- dimnames(probs)[[2]]
+  if (!length(lev)) 
+    lev <- 1:k
+  ran <- matrix(lev[1], ncol = m, nrow = n)
+  U <- t(probs)
+  for(i in 2:k) {
+    U[i, ] <- U[i, ] + U[i - 1, ]
+  }
+  if (any((U[k, ] - 1) > 1e-05))
+    stop("error in multinom: probabilities do not sum to 1")
+  
+  for (j in 1:m) {
+    un <- rep(runif(n), rep(k, n))
+    ran[, j] <- lev[1 + colSums(un > U)]
+  }
+  ran
+}
+
+
+
+# The MicroSim2 functions for the Markov microsimulation #
+
+MicroSim <- function(v.M_1, n.i, n.t, v.n, d.c, d.e, TR.out = TRUE, TS.out = TRUE, seed = 1892) {   
+  # Arguments:  
+  # v.M_1:   vector of initial states for individuals 
+  # n.i:     number of individuals
+  # n.t:     total number of cycles to run the model
+  # v.n:     vector of health state names
+  # d.c:     discount rate for costs
+  # d.e:     discount rate for health outcomes (QALYs)
+  # TR.out:  should the output include a microsimulation trace? (default is TRUE)
+  # TS.out:  should the output include a matrix of transitions between states? (default is TRUE)
+  
+  # seed:    starting seed number for random number generator (default is 1)
+  # Makes use of:
+  # Probs:   function for the estimation of transition probabilities
+  # Costs:   function for the estimation of cost state values
+  # Effs:    function for the estimation of state specific health outcomes (QALYs)
+  
+  v.dwc <- 1 / ((1 + d.c) ^ (0:n.t))   # calculate the cost discount weight based on the discount rate d.c
+  v.dwe <- 1 / ((1 + d.e) ^ (0:n.t))   # calculate the QALY discount weight based on the discount rate d.e
+  
+  # create the matrix capturing the state name/costs/health outcomes for all individuals at each time point 
+  m.M <- m.C <- m.E <- matrix(nrow = n.i, ncol = n.t + 1,
+                              dimnames = list(paste("ind",   1:n.i, sep =" "),
+                                              paste("cycle", 0:n.t, sep =" "))) 
+  
+  # Initial health state - all are "No breast cancer" #
+  m.M[, 1] <- v.M_1            
+  
+  set.seed(seed) 
+  
+  # Create variables that are used to track number of consecutive cycles that a 
+  # person spends in states where there may be time-varying transition probabilities or costs #
+  dur       <- rep(0, n.i)    # duration - will be used for years spent in cancer/pre-cancer states. Start at 0 
+  deathtime <- rep(0, n.i)    # time spent in death state (years) - used for terminal care costs 
+  time      <- rep(40, n.i)   # age-based transition probabilities for no breast cancer -> DCIS/cancer, everyone starts at 40   
+  age       <- rep(40, n.i)   # age-based transition probabilities for DCIS -> other states, everyone starts at age 40 
+  
+  m.C[, 1] <- Costs(m.M[, 1], dur, deathtime, time)  # Costs in the initial health state 
+  m.E[, 1] <- Effs(m.M[, 1], time)                         # Utility values (QALY) for those in initial health state 
+  
+  
+  for (t in 1:n.t) {      # Loop over number of cycles, from start to finish 
+    
+    m.p <- Probs(m.M[, t], time, dur, age)    # Matrix of probabilities, the states at time 't'
+    
+    m.M[, t + 1] <- samplev(prob = m.p, m = 1)                    # sample the next health state and store that state in matrix m.M 
+    m.C[, t + 1] <- Costs(m.M[, t + 1], dur, deathtime, time)     # estimate costs per individual during cycle t + 1 
+    m.E[, t + 1] <- Effs( m.M[, t + 1], time)                     # estimate QALYs per individual during cycle t + 1 
+    
+    # Variable 'dur' : duration (years) spent in DCIS/cancer states, so that costs and risks of other transitions
+    # can be assigned/vary as appropriate 
+    # Use ifelse function - if they occupy DCIS/others in the next time (t+1), increment it up 
+    # dur==0 first time in state, dur=1 next year, so on. 
+    
+    dur <- ifelse(m.M[, t+1] == "Stage 1 cancer" | m.M[, t+1] == "Stage 2 cancer" | m.M[, t+1] == "Stage 3 cancer" | m.M[, t + 1] == "Stage 4 cancer", 
+                  dur + 1, 
+                  0) 
+    
+    # Breast cancer death is an absorbing state - in this model, we apportion costs of terminal cancer care on entry into this state, 
+    # then the cost is £0 thereafter. 
+    # death time=0 means just entered this state. 
+    deathtime <- ifelse(m.M[, t+1] == "Breast cancer death" , 
+                        deathtime + 1, 
+                        0)
+    
+    # 'Time' variable' - this is to modify breast cancer incidence rate as people age. Start at 40 #
+    time <- ifelse(m.M[, t+1] == "No cancer", 
+                   time + 1, 
+                   time)
+    
+    # Age variable is used for transitioning out of DCIS state (works in same way as 'time', but need distinct value for code to run) # 
+    age <- ifelse(m.M[, t+1] == "No cancer" | m.M[, t+1] == "DCIS" ,   # if still in no cancer or DCIS, increment up. 
+                  age + 1, 
+                  age) 
+    
+    cat('\r', paste(round(t/n.t * 100), "% done", sep = " "))       # display the progress of the simulation
+    
+  }
+  
+  
+  tc <- m.C %*% v.dwc       # total (discounted) cost per individual
+  te <- m.E %*% v.dwe       # total (discounted) QALYs per individual 
+  
+  tc_hat <- mean(tc)        # average (discounted) cost 
+  te_hat <- mean(te)        # average (discounted) QALYs
+  
+  if (TS.out == TRUE) {  # create a matrix of transitions across states if wanted 
+    TS <- paste(m.M, cbind(m.M[, -1], NA), sep = "->") # transitions from one state to the other
+    TS <- matrix(TS, nrow = n.i)
+    rownames(TS) <- paste("Ind",   1:n.i, sep = " ")   # name the rows (Individual)
+    colnames(TS) <- paste("Cycle", 0:n.t, sep = " ")   # name the columns (cycle number) 
+  } else {
+    TS <- NULL
+  }
+  
+  if (TR.out == TRUE) {
+    TR <- t(apply(m.M, 2, function(x) table(factor(x, levels = v.n, ordered = TRUE))))
+    TR <- TR / n.i                                       # create a distribution trace
+    rownames(TR) <- paste("Cycle", 0:n.t, sep = " ")     # name the rows 
+    colnames(TR) <- v.n                                  # name the columns 
+  } else {
+    TR <- NULL
+  }
+  results <- list(m.M = m.M, m.C = m.C, m.E = m.E, tc = tc, te = te, tc_hat = tc_hat, te_hat = te_hat, TS = TS, TR = TR) # store the results from the simulation in a list  
+  return(results)  # return the results! 
+}  
+
+# end of the MicroSim function  
+
+
+#### Probability function
+# The Probs function that updates the transition probabilities of every cycle is shown below.
+
+Probs <- function(M_it, time, dur, age ) {   
+  # M_it:        health state occupied by individual i at cycle t (character variable)
+  # time:        variable that increments up each cycle, represents age (years after 40) 
+  
+  m.p.it <- matrix(NA, n.s, n.i)     # create vector of state transition probabilities
+  rownames(m.p.it) <- v.n            # name the vector
+  
+  # Probability of transitioning from 'no breast cancer' to breast cancer varies by age ('time')
+  p.healthy_cancer <- 0.004 + ((((time[M_it == "No cancer"]/10)^-2) - 0.0219478738)*-0.0636486)
+  
+  # Probability of moving from no breast cancer to other-cause death state, as function of age 
+  # Exponential function as ractional polynomials result n values that are negative for some strata!
+  p.healthy_other_death <-  5.95e-06 * 1.118616^(time[M_it=="No cancer"]) 
+  
+  # Probability of transitioning into DCIS state depends on age (use the time variable to keep neat) #
+  p.dcis1 <- ((((time[M_it == "No cancer"]/10)^-2)-0.0219478738)*-0.1078213)
+  p.dcis2 <- ((((time[M_it == "No cancer"]/10)^-1)-0.1481481481)*0.0389818) 
+  p.healthy_dcis <- 0.0005328 + p.dcis1 + p.dcis2  
+  
+  # Probability of moving from DCIS to breast cancer (any stage) #
+  p.dcis_cancer <- 0.0038375 + ((((age[M_it == "DCIS"]/10)^-2) - 0.0219478738)*-0.0636486)*rr.dcis 
+  
+  # Probability of moving from DCIS to other-cause death #
+  p.dcis_other_death <- 5.95e-06 * 1.118616^(time[M_it=="DCIS"])
+  
+  # Transition from stage 1 breast cancer to breast cancer-related death #
+  p.stage1_breast_death <- 0.08664 + ((-10.5+dur[M_it == "Stage 1 cancer"])*0.00836)
+  
+  # Transition from stage 1 breast cancer to other-cause death #
+  p.stage1_1 <- ((((dur[M_it=="Stage 1 cancer"]/10)^2)-1.1025)*0.0898476)
+  p.stage1_2 <- log(time[M_it=="Stage 1 cancer"]/10)
+  p.stage1_3 <- ((((dur[M_it=="Stage 1 cancer"]/10)^2)*p.stage1_2) - 0.053791156)*-0.0397146
+  p.stage1_other_death  <- 0.1048449 + p.stage1_1 + p.stage1_2
+  
+  # Transition from stage 2 breast cancer to breast cancer-related death #
+  p.stage2_1 <- ((((dur[M_it=="Stage 2 cancer"]/10)^-1) - 0.9523809524)*0.0025858)
+  p.stage2_2 <- ((((dur[M_it=="Stage 2 cancer"]/10)^0.5) - 1.024695077)*0.3328955)
+  p.stage2_breast_death <- 0.2311162 + p.stage2_1 + p.stage2_2 
+  
+  # Transition from stage 2 breast cancer to other-cuse death #
+  p.stage2_3 <- ((dur[M_it=="Stage 2 cancer"]/10)-1.05)*0.099961
+  p.stage2_4 <- (((dur[M_it=="Stage 2 cancer"]/10)^2)-1.1025)*0.0266473
+  p.stage2_other_death <- 0.1313998 + p.stage2_3 + p.stage2_4 
+  
+  # Transition from stage 3 breast cancer to breast cancer-related death #
+  p.stage3_1 <- ((((dur[M_it=="Stage 3 cancer"]/10)^0.5) - 1.024695077)*0.6583406) 
+  p.stage3_2 <- (((dur[M_it=="Stage 3 cancer"]/10)^2) - 1.1025)*-0.0474546
+  p.stage3_breast_death <- 0.4677987 + p.stage3_1 + p.stage3_2 
+  
+  # Transition from stage 3 breast cancer to other-cause death #
+  p.stage3_3 <- ((((dur[M_it=="Stage 3 cancer"]/10)^0.5)-1.024695077)*-0.0936176)
+  p.stage3_4 <- (((dur[M_it=="Stage 3 cancer"]/10)-1.05)*0.2057249)
+  p.stage3_other_death <- 0.13567 + p.stage3_3 + p.stage3_4 
+  
+  # Transition from stage 4 breast cancer to breast cancer-related death #
+  p.stage4_breast_death <- 0.8006917 + (((log(dur[M_it=="Stage 4 cancer"]/10)) - 0.0487901642)*0.2044025)
+  
+  # Transition from stage 4 breast cancer to other-cause death #
+  p.stage4_other_death  <- 0.14127 + ((-10.5+dur[M_it == "Stage 4 cancer"])*0.0115896)   
+  
+  
+  # update m.p.it with the appropriate probabilities   
+  m.p.it[,M_it ==  "No cancer"]           <- rbind(1 - p.healthy_dcis - p.healthy_cancer*p.stage1 - p.healthy_cancer*p.stage2 - p.healthy_cancer*p.stage3 - p.healthy_cancer*p.stage4 - p.healthy_other_death, p.healthy_dcis, p.healthy_cancer*p.stage1, p.healthy_cancer*p.stage2,  p.healthy_cancer*p.stage3, p.healthy_cancer*p.stage4, 0, p.healthy_other_death)
+  m.p.it[,M_it ==  "DCIS"]                <- rbind(0, 1 - p.dcis_cancer*p.stage1 - p.dcis_cancer*p.stage2 - p.dcis_cancer*p.stage3 - p.dcis_cancer*p.stage4 - p.dcis_other_death, p.dcis_cancer*p.stage1, p.dcis_cancer*p.stage2, p.dcis_cancer*p.stage3, p.dcis_cancer*p.stage4, 0, p.dcis_other_death)
+  m.p.it[,M_it ==  "Stage 1 cancer"]      <- rbind(0, 0, 1 - p.stage1_breast_death - p.stage1_other_death,         0, 0, 0,  p.stage1_breast_death, p.stage1_other_death)
+  m.p.it[,M_it ==  "Stage 2 cancer"]      <- rbind(0, 0, 0, 1 - p.stage2_breast_death - p.stage2_other_death,      0, 0,  p.stage2_breast_death, p.stage2_other_death)
+  m.p.it[,M_it ==  "Stage 3 cancer"]      <- rbind(0, 0, 0, 0, 1 - p.stage3_breast_death - p.stage3_other_death,   0,  p.stage3_breast_death, p.stage3_other_death)
+  m.p.it[,M_it ==  "Stage 4 cancer"]      <- rbind(0, 0, 0, 0, 0, 1 - p.stage4_breast_death - p.stage4_other_death,  p.stage4_breast_death, p.stage4_other_death)
+  m.p.it[,M_it ==  "Breast cancer death"] <-     c(0, 0, 0, 0, 0, 0, 1, 0)
+  m.p.it[,M_it ==  "Other cause death"]   <-     c(0, 0, 0, 0, 0, 0, 0, 1)
+  
+  ifelse(colSums(m.p.it) == 1, return(t(m.p.it)), print("Probabilities do not sum to 1")) # return the transition probabilities or produce an error
+}    
+
+### Costs function
+# The Costs function estimates the costs at every cycle for the extended microsimulaton.
+
+Costs <- function (M_it, dur, deathtime, time) {  
+  
+  # Update costs based on duration of time spent in state, e.g. diagnosis costs versus follow-up years costs   
+  
+  c.it                                     <- 0    # Default costs are 0
+  
+  c.it[M_it == "No cancer"]                <- 0
+  c.it[M_it == "No cancer" & time%%3==0]   <- c.mammography    # Accrue costs of mammography every 3 years in 'healthy' state 
+  #c.it[M_it == "No cancer" & time==0]      <- 0  # Don't apply charge for mamography in cycle 0 (starting state, no transitions) 
+  
+  # Assign costs for DCIS state depending on how long they've been in there #
+  # First-year costs are the diagnostic and initial treatment #
+  # Subsequent costs are 0. Dur==0 means just entered that state, then dur = 1 in state at t+1 
+  c.it[M_it == "DCIS"]                     <- 0
+  c.it[M_it == "DCIS" & dur==0]            <- c.dcis
+  
+  # Assign costs for diagnosis and initial treatment of stage 1 breast cancer #
+  c.it[M_it == "Stage 1 cancer" & dur==0]           <- c.stage1_cancer
+  # Assign costs for follow-up and adjuvant therapy, up to max of 5 years #
+  c.it[M_it == "Stage 1 cancer" & dur>0 & dur<=5]   <- c.follow_up
+  c.it[M_it == "Stage 1 cancer" & dur>5]            <- 0
+  
+  
+  # Assign costs for diagnosis and initial treatment of stage 1 breast cancer #
+  c.it[M_it == "Stage 2 cancer" & dur==0]           <- c.stage2_cancer
+  # Assign costs for follow-up and adjuvant therapy, up to max of 5 years #
+  c.it[M_it == "Stage 2 cancer" & dur>0 & dur<=5]   <- c.follow_up
+  c.it[M_it == "Stage 2 cancer" & dur>5]            <- 0
+  
+  
+  # Assign costs for diagnosis and initial treatment of stage 1 breast cancer #
+  c.it[M_it == "Stage 3 cancer" & dur==0]           <- c.stage3_cancer
+  # Assign costs for follow-up and adjuvant therapy, up to max of 5 years #
+  c.it[M_it == "Stage 3 cancer" & dur>0 & dur<=5]   <- c.follow_up
+  c.it[M_it == "Stage 3 cancer" & dur>5]            <- 0
+  
+  
+  # Assign costs for diagnosis and initial treatment of stage 1 breast cancer #
+  c.it[M_it == "Stage 4 cancer" & dur==0]           <- c.stage4_cancer
+  # Assign costs for follow-up and adjuvant therapy, up to max of 5 years #
+  c.it[M_it == "Stage 4 cancer" & dur>0 & dur<=5]   <- c.follow_up
+  c.it[M_it == "Stage 4 cancer" & dur>5]            <- 0
+  
+  # Assign costs for end-of-life care when dying from breast cancer #
+  c.it[M_it == "Breast cancer death" & deathtime==0]    <- c.breast_ca_death
+  c.it[M_it == "Breast cancer death" & deathtime>0]     <- 0
+  
+  # Cost of dying from something else (were are not doing wider perspective, so 0) #
+  c.it[M_it == "Other cause death"]        <- 0
+  
+  return(c.it)                                # return the costs
+  
+}
+
+
+### Health outcome function 
+# The Effs function to update the utilities at every cycle for the extended microsimulaton.
+
+Effs <- function (M_it, time, cl = 1) {     # Time is number of Markov cycles - i.e years since simulation started 
+  # M_it: health state occupied by individual i at cycle t (character variable)
+  # cl:   the cycle length (default = 1 )
+  
+  # QoL declines with age - factor this in # 
+  u.healthy_with_time <- u.healthy - (0.0043*(time[M_it=="No cancer"]))    
+  
+  u.it                                   <- 0        # by default the utility for everyone is zero
+  u.it[M_it == "No cancer"]              <- u.healthy_with_time 
+  u.it[M_it == "DCIS"]                   <- u.dcis_diagnosis
+  u.it[M_it == "Stage 1 cancer"]         <- u.local_diagnosis
+  u.it[M_it == "Stage 2 cancer"]         <- u.regional_cancer
+  u.it[M_it == "Stage 3 cancer"]         <- u.regional_cancer
+  u.it[M_it == "Stage 4 cancer"]         <- u.metastatic_cancer 
+  u.it[M_it == "Breast cancer death"]    <- 0 
+  u.it[M_it == "Other cause death"]      <- 0 
+  
+  QALYs <- u.it * cl             # calculate the QALYs during cycle t
+  return(QALYs)                  # return the results
+}
+
+
+
+
+## Start the simulation ##
+
+start <- Sys.time() 
+simulation2 <- MicroSim(v.M_1, n.i, n.t, v.n, d.c, d.e)
+end <- Sys.time() 
+
+end-start        
+
+
+################################################################################
+################################################################################
+
+
+
+
+###########################################
+## Sniff test - calibration of the model ##
+###########################################
+
+# Proportions that entered the breast cancer mortality state, and other-cause mortality states #
+simulation2$TR 
+
+# Cumulative % risk of dying from breast cancer from age 40 to end of life #
+(simulation2$TR[61, 8])*100
+
+# Cumulative % risk of dying from a non-breast cancer cause from age 40 to end of life #
+(simulation2$TR[61, 7])*100 
+
+# Cumulative % risk of breast cancer diagnosis from age 40 to end of life #
+stage1 <- sum(simulation2$TS=="No cancer->Stage 1 cancer") 
+stage2 <- sum(simulation2$TS=="No cancer->Stage 2 cancer") 
+stage3 <- sum(simulation2$TS=="No cancer->Stage 3 cancer") 
+stage4 <- sum(simulation2$TS=="No cancer->Stage 4 cancer") 
+stage5 <- sum(simulation2$TS=="DCIS->Stage 1 cancer") 
+stage6 <- sum(simulation2$TS=="DCIS->Stage 2 cancer") 
+stage7 <- sum(simulation2$TS=="DCIS->Stage 3 cancer") 
+stage8 <- sum(simulation2$TS=="DCIS->Stage 4 cancer") 
+
+cancers <- stage1+stage2+stage3+stage4+stage5+stage6+stage7+stage8
+(cancers/n.i)*100
+
+dcis <- sum(simulation2$TS=="No cancer->DCIS")
+(dcis/n.i)*100
+
+################################################################################
+
+
+## What about the cumulative risks at age 50, 60... etc? ##
+
+# Clear up memory, then re-run model with 10 cycles, 20 cycles, etc. #
+rm(simulation2)
+
+
+# Define some functions to return the percentages at different time points #
+
+# Incident cancers diagnosed #
+cancers <- function(x) { 
+  summ <-  sum(x$TS=="No cancer->Stage 1 cancer") + 
+    sum(x$TS=="No cancer->Stage 2 cancer") + 
+    sum(x$TS=="No cancer->Stage 3 cancer") + 
+    sum(x$TS=="No cancer->Stage 4 cancer") + 
+    sum(x$TS=="DCIS->Stage 1 cancer") + 
+    sum(x$TS=="DCIS->Stage 2 cancer") + 
+    sum(x$TS=="DCIS->Stage 3 cancer") +     
+    sum(x$TS=="DCIS->Stage 4 cancer") 
+  
+  return((summ/n.i)*100)
+}
+
+# DCIS diagnosed #
+dcis <- function(x) {
+  summ <- sum(x$TS=="No cancer->DCIS")
+  return((summ/n.i)*100)
+  
+}
+
+
+# Set up matrix to store runs with increasing cycle numbers #
+
+stored_results <- matrix(NA, nrow = 12, ncol = 4)
+
+# Use 5 year age bands, multiply seq numberby 5 to get years right #
+
+for (i in 1:12) { 
+  
+  # number of cycles to run for #
+  cycles <- as.numeric(i*5) 
+  
+  # simulation command as defined above - feed in 'cycles' here #
+  simulation <- MicroSim(v.M_1, n.i, cycles, v.n, d.c, d.e)
+  
+  # Percentage of people that were diagnosed with breast cancer #
+  stored_results[i, 1] <-  cancers(simulation) 
+  
+  # Percentage diagnosed with DCIS #
+  stored_results[i, 2] <- dcis(simulation) 
+  
+  # Need to look in cycle+1 row of matrix for final cycle value, as matrix prints from cycle=0, not cycle=1 #
+  final_cycle <- as.numeric(cycles+1) 
+  
+  # Percentage breast cancer deaths #
+  stored_results[i, 3] <- ((simulation$TR[final_cycle, 7])*100)
+  
+  # Percentage other cause deaths #
+  stored_results[i, 4] <- ((simulation$TR[final_cycle, 8])*100)
+  
+  rm(simulation)
+  gc() 
+  
+  }
+
+################################################################################
+################################################################################
+
+rm(list=ls()) 
